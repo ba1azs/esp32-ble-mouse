@@ -20,6 +20,7 @@ enum KeyboardLayout {
 
 KeyboardLayout activeLayout = LAYOUT_DE;
 
+
 WebServer server(80);
 RTC_DS3231 rtc;
 Adafruit_MPU6050 mpu;
@@ -1385,15 +1386,15 @@ void runScheduledTask() {
     Serial.println("Scheduled task skipped: BLE HID not connected");
     return;
   }
+
+  tapKey(KEY_ENTER);
   mouse->mouseMove(10, 0);
   mouse->sendMouseReport();
   delay(200);
 
   leftClick();
-  delay(200);
-  leftClick();
-  delay(200);
   typeText(scheduledTaskText.c_str());
+  delay(200);
   tapKey(KEY_ENTER);
 }
 
@@ -1785,7 +1786,7 @@ void setup() {
 void loop() {
   manageHotspotByOrientation();
   handleScheduledTaskRun();
-  handleMouseJiggle();
+  loadJiggleFromFlash();
   bool hotspotClient = apStarted && (WiFi.softAPgetStationNum() > 0);
 
 
