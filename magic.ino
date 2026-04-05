@@ -1,5 +1,6 @@
-#include <BleMouse.h>
-#include <BLESecurity.h>
+#include <BleCompositeHID.h>
+#include <KeyboardDevice.h>
+#include <MouseDevice.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Update.h>
@@ -11,17 +12,25 @@
 #include <Preferences.h>
 #include <math.h>
 
-BleMouse bleMouse("Magic Mouse", "Apple", 100);
+enum KeyboardLayout {
+  LAYOUT_US,
+  LAYOUT_DE,
+  LAYOUT_HU
+};
+
+KeyboardLayout activeLayout = LAYOUT_DE;
+
 WebServer server(80);
 RTC_DS3231 rtc;
 Adafruit_MPU6050 mpu;
 Preferences prefs;
-
+KeyboardDevice* keyboard;
+MouseDevice* mouse;
+BleCompositeHID compositeHID("CompositeHID Keyboard and Mouse", "Mystfit", 100);
 // ---------------- SETTINGS ----------------
 
-const unsigned long jiggleInterval = 60000;
-const unsigned long sleepTimeout = 300000;
 const unsigned long hotspotStopDelay = 30000;
+const unsigned long jiggleInterval = 60000; // 60 seconds
 
 const char* apSSID = "Magic Mouse";
 const char* apPassword = "";
@@ -76,6 +85,30 @@ float gyroOffsetX  = -0.0656f;
 float gyroOffsetY  = 0.0128f;
 float gyroOffsetZ  = 0.0097f;
 
+
+struct ScheduledTaskConfig {
+  bool enabled = false;
+  bool repeat = false;
+
+  // once
+  int year = 0;
+  int month = 0;
+  int day = 0;
+
+  // once + repeat
+  int hour = 0;
+  int minute = 0;
+
+  // repeat bitmask: bit0=Sun ... bit6=Sat
+  uint8_t daysMask = 0;
+
+  // prevents multiple runs in same minute/day
+  uint32_t lastRunKey = 0;
+};
+
+ScheduledTaskConfig scheduledTask;
+String scheduledTaskText = "Hello world!";
+
 // ---------------- OTA PAGE ----------------
 
 const char* otaPage = R"rawliteral(
@@ -104,10 +137,10 @@ progress{
   padding-top:18px;
   border-top:1px solid #ccc;
 }
-input,button{
+input,button,select{
   font-size:16px;
 }
-input[type="datetime-local"]{
+input[type="datetime-local"], input[type="time"], input[type="text"], select{
   width:100%;
   padding:8px;
   box-sizing:border-box;
@@ -172,21 +205,67 @@ button{
 </div>
 
 <div class="section">
-  <h2>Gyroscope Mouse</h2>
-  <div class="small">Use the MPU6050 to move the BLE mouse cursor.</div>
-  <div class="state" id="gyroState">Loading state...</div>
-  <button onclick="toggleGyro()">Mouse control with gyroscope</button>
-  <button onclick="recalibrateGyro()">Recalibrate gyroscope</button>
-  <div id="gyroStatus"></div>
-  <div id="recalStatus"></div>
+  <h2>Scheduled Task</h2>
+
+  <label for="scheduleMode"><b>Mode</b></label>
+  <select id="scheduleMode" onchange="toggleScheduleMode()" style="width:100%;padding:8px;margin-top:6px;">
+    <option value="once">Once</option>
+    <option value="repeat">Repeat</option>
+  </select>
+
+  <div id="onceBox" style="margin-top:12px;">
+    <label for="scheduleDateTime"><b>Date and time</b></label>
+    <input type="datetime-local" id="scheduleDateTime">
+  </div>
+
+  <div id="repeatBox" style="display:none;margin-top:12px;">
+    <label for="repeatTime"><b>Time</b></label>
+    <input type="time" id="repeatTime" style="width:100%;padding:8px;box-sizing:border-box;">
+
+    <div style="margin-top:12px;">
+      <b>Repeat on</b>
+      <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:8px;">
+        <label><input type="checkbox" class="weekday" value="0"> Sunday</label>
+        <label><input type="checkbox" class="weekday" value="1"> Monday</label>
+        <label><input type="checkbox" class="weekday" value="2"> Tuesday</label>
+        <label><input type="checkbox" class="weekday" value="3"> Wednesday</label>
+        <label><input type="checkbox" class="weekday" value="4"> Thursday</label>
+        <label><input type="checkbox" class="weekday" value="5"> Friday</label>
+        <label><input type="checkbox" class="weekday" value="6"> Saturday</label>
+      </div>
+    </div>
+  </div>
+
+  <div style="margin-top:12px;">
+    <label for="taskText"><b>Text to type</b></label>
+    <input type="text" id="taskText" value="Hello world!" style="width:100%;padding:8px;box-sizing:border-box;">
+    <div class="small">This text will be saved in memory and used when the scheduled task runs.</div>
+  </div>
+
+  <button onclick="saveSchedule()">Save Schedule</button>
+  <button onclick="loadSchedule()">Refresh Schedule</button>
+
+  <div id="scheduleStatus"></div>
+  <div class="state" id="scheduleNow">Loading schedule...</div>
 </div>
 
 <div class="section">
   <h2>Mouse Jiggle</h2>
-  <div class="small">Prevents sleep by moving the cursor.</div>
-  <div class="state" id="jiggleState">Loading state...</div>
-  <button onclick="toggleJiggle()">Toggle Jiggle</button>
+  <div class="small">Keeps the mouse active by moving it slightly. Default is ON.</div>
+
+  <div style="margin-top:12px;">
+    <label for="jiggleEnabledSelect"><b>Jiggle</b></label>
+    <select id="jiggleEnabledSelect" style="width:100%;padding:8px;margin-top:6px;">
+      <option value="on">ON</option>
+      <option value="off">OFF</option>
+    </select>
+  </div>
+
+  <button onclick="saveJiggle()">Save Mouse Jiggle</button>
+  <button onclick="loadJiggle()">Refresh Mouse Jiggle</button>
+
   <div id="jiggleStatus"></div>
+  <div class="state" id="jiggleNow">Loading jiggle state...</div>
 </div>
 
 <div class="section">
@@ -275,65 +354,110 @@ function loadRtcTimeIntoInput(){
   xhr.send();
 }
 
-function refreshGyroState(){
-  let xhr = new XMLHttpRequest();
-  xhr.onreadystatechange = function(){
-    if(xhr.readyState == 4 && xhr.status == 200){
-      document.getElementById("gyroState").innerHTML = xhr.responseText;
-    }
-  };
-  xhr.open("GET", "/gyrostate", true);
-  xhr.send();
+function toggleScheduleMode(){
+  let mode = document.getElementById("scheduleMode").value;
+  document.getElementById("onceBox").style.display = (mode === "once") ? "block" : "none";
+  document.getElementById("repeatBox").style.display = (mode === "repeat") ? "block" : "none";
 }
 
-function refreshJiggleState(){
+function saveSchedule(){
+  let mode = document.getElementById("scheduleMode").value;
+  let taskText = document.getElementById("taskText").value;
+
+  if(!taskText){
+    taskText = "Hello world!";
+  }
+
+  let payload = {
+    mode: mode,
+    text: taskText
+  };
+
+  if(mode === "once"){
+    let dt = document.getElementById("scheduleDateTime").value;
+    if(!dt){
+      alert("Select date and time first");
+      return;
+    }
+    payload.datetime = dt;
+  } else {
+    let t = document.getElementById("repeatTime").value;
+    if(!t){
+      alert("Select repeat time first");
+      return;
+    }
+    payload.time = t;
+
+    let days = [];
+    let boxes = document.querySelectorAll(".weekday");
+    for(let i = 0; i < boxes.length; i++){
+      if(boxes[i].checked){
+        days.push(parseInt(boxes[i].value));
+      }
+    }
+
+    if(days.length === 0){
+      alert("Select at least one weekday");
+      return;
+    }
+
+    payload.days = days;
+  }
+
   let xhr = new XMLHttpRequest();
   xhr.onreadystatechange = function(){
-    if(xhr.readyState == 4 && xhr.status == 200){
-      document.getElementById("jiggleState").innerHTML = xhr.responseText;
+    if(xhr.readyState === 4){
+      document.getElementById("scheduleStatus").innerHTML = xhr.responseText;
+      loadSchedule();
     }
   };
-  xhr.open("GET", "/jigglestate", true);
-  xhr.send();
+
+  xhr.open("POST", "/schedule", true);
+  xhr.setRequestHeader("Content-Type", "application/json");
+  xhr.send(JSON.stringify(payload));
+
+  document.getElementById("scheduleStatus").innerHTML = "Saving schedule...";
 }
 
-function toggleJiggle(){
+function loadSchedule(){
   let xhr = new XMLHttpRequest();
   xhr.onreadystatechange = function(){
-    if(xhr.readyState == 4){
-      document.getElementById("jiggleStatus").innerHTML = xhr.responseText;
-      refreshJiggleState();
-    }
-  };
-  xhr.open("POST", "/togglejiggle", true);
-  xhr.send();
-  document.getElementById("jiggleStatus").innerHTML = "Changing state...";
-}
+    if(xhr.readyState === 4){
+      if(xhr.status === 200){
+        let data = JSON.parse(xhr.responseText);
 
-function toggleGyro(){
-  let xhr = new XMLHttpRequest();
-  xhr.onreadystatechange = function(){
-    if(xhr.readyState == 4){
-      document.getElementById("gyroStatus").innerHTML = xhr.responseText;
-      refreshGyroState();
-    }
-  };
-  xhr.open("POST", "/togglegyro", true);
-  xhr.send();
-  document.getElementById("gyroStatus").innerHTML = "Changing state...";
-}
+        document.getElementById("scheduleMode").value = data.mode || "once";
+        document.getElementById("taskText").value = data.text || "Hello world!";
+        toggleScheduleMode();
 
-function recalibrateGyro(){
-  let xhr = new XMLHttpRequest();
-  xhr.onreadystatechange = function(){
-    if(xhr.readyState == 4){
-      document.getElementById("recalStatus").innerHTML = xhr.responseText;
-      refreshGyroState();
+        if(data.mode === "once"){
+          document.getElementById("scheduleDateTime").value = data.datetime || "";
+        } else {
+          document.getElementById("repeatTime").value = data.time || "";
+
+          let boxes = document.querySelectorAll(".weekday");
+          for(let i = 0; i < boxes.length; i++){
+            boxes[i].checked = false;
+          }
+
+          if(data.days){
+            for(let i = 0; i < data.days.length; i++){
+              let day = data.days[i];
+              let el = document.querySelector('.weekday[value="' + day + '"]');
+              if(el) el.checked = true;
+            }
+          }
+        }
+
+        document.getElementById("scheduleNow").innerHTML = data.summary || "No schedule set";
+      } else {
+        document.getElementById("scheduleNow").innerHTML = "Failed to load schedule";
+      }
     }
   };
-  xhr.open("POST", "/recalibrate", true);
+
+  xhr.open("GET", "/schedule", true);
   xhr.send();
-  document.getElementById("recalStatus").innerHTML = "Recalibrating... keep device still";
 }
 
 function refreshGPIO(){
@@ -361,11 +485,108 @@ function refreshGPIO(){
   xhr.send();
 }
 
+function saveSchedule(){
+  let mode = document.getElementById("scheduleMode").value;
+  let taskText = document.getElementById("taskText").value;
+
+  if(!taskText){
+    taskText = "Hello world!";
+  }
+
+  let payload = {
+    mode: mode,
+    text: taskText
+  };
+
+  if(mode === "once"){
+    let dt = document.getElementById("scheduleDateTime").value;
+    if(!dt){
+      alert("Select date and time first");
+      return;
+    }
+    payload.datetime = dt;
+  } else {
+    let t = document.getElementById("repeatTime").value;
+    if(!t){
+      alert("Select repeat time first");
+      return;
+    }
+    payload.time = t;
+
+    let days = [];
+    let boxes = document.querySelectorAll(".weekday");
+    for(let i = 0; i < boxes.length; i++){
+      if(boxes[i].checked){
+        days.push(parseInt(boxes[i].value));
+      }
+    }
+
+    if(days.length === 0){
+      alert("Select at least one weekday");
+      return;
+    }
+
+    payload.days = days;
+  }
+
+  let xhr = new XMLHttpRequest();
+  xhr.onreadystatechange = function(){
+    if(xhr.readyState === 4){
+      document.getElementById("scheduleStatus").innerHTML = xhr.responseText;
+      loadSchedule();
+    }
+  };
+
+  xhr.open("POST", "/schedule", true);
+  xhr.setRequestHeader("Content-Type", "application/json");
+  xhr.send(JSON.stringify(payload));
+
+  document.getElementById("scheduleStatus").innerHTML = "Saving schedule...";
+}
+
+function saveJiggle(){
+  let enabled = document.getElementById("jiggleEnabledSelect").value === "on";
+
+  let xhr = new XMLHttpRequest();
+  xhr.onreadystatechange = function(){
+    if(xhr.readyState === 4){
+      document.getElementById("jiggleStatus").innerHTML = xhr.responseText;
+      loadJiggle();
+    }
+  };
+
+  xhr.open("POST", "/jiggle", true);
+  xhr.setRequestHeader("Content-Type", "application/x-www-form-urlencoded");
+  xhr.send("enabled=" + (enabled ? "1" : "0"));
+
+  document.getElementById("jiggleStatus").innerHTML = "Saving jiggle setting...";
+}
+
+function loadJiggle(){
+  let xhr = new XMLHttpRequest();
+  xhr.onreadystatechange = function(){
+    if(xhr.readyState === 4){
+      if(xhr.status === 200){
+        let data = JSON.parse(xhr.responseText);
+
+        document.getElementById("jiggleEnabledSelect").value = data.enabled ? "on" : "off";
+        document.getElementById("jiggleNow").innerHTML = "Mouse jiggle: " + (data.enabled ? "ON" : "OFF");
+      } else {
+        document.getElementById("jiggleNow").innerHTML = "Failed to load jiggle state";
+      }
+    }
+  };
+
+  xhr.open("GET", "/jiggle", true);
+  xhr.send();
+}
+
 window.onload = function(){
-  refreshGyroState();
   refreshRtcTime();
   refreshGPIO();
-  refreshJiggleState();
+  loadSchedule();
+  loadJiggle();
+  toggleScheduleMode();
 };
 </script>
 
@@ -374,6 +595,8 @@ window.onload = function(){
 )rawliteral";
 
 // ---------------- VIBRATION ----------------
+
+
 
 void vibrateOnce(int onMs = 120, int offMs = 0) {
   digitalWrite(VIBRATION_PIN, HIGH);
@@ -671,103 +894,7 @@ bool isHeadDownNow(float &ax, float &ay, float &az, float &gx, float &gy, float 
   return (az < HEAD_DOWN_Z_THRESHOLD);
 }
 
-void handleGyroMouse() {
-  if (!gyroMouseEnabled) return;
-  if (!mpuAvailable) return;
-  if (!bleMouse.isConnected()) return;
 
-  static float smoothGZ = 0;
-  static float smoothGY = 0;
-
-  unsigned long now = millis();
-  if (now - lastGyroMove < gyroMoveInterval) return;
-  lastGyroMove = now;
-
-  float ax, ay, az, gx, gy, gz;
-  readCorrectedMPU(ax, ay, az, gx, gy, gz);
-
-  // ---------------- SETTINGS ----------------
-  const float DEADZONE = 0.03f;
-  const float SMOOTHING = 0.85f;     // higher = smoother
-  const float BASE_SPEED = 12.0f;    // base sensitivity
-  const float ACCEL_MULT = 2.5f;     // dynamic acceleration
-
-  // ---------------- DEADZONE ----------------
-  if (fabs(gz) < DEADZONE) gz = 0;
-  if (fabs(gy) < DEADZONE) gy = 0;
-
-  // ---------------- SMOOTHING ----------------
-  smoothGZ = smoothGZ * SMOOTHING + gz * (1.0f - SMOOTHING);
-  smoothGY = smoothGY * SMOOTHING + gy * (1.0f - SMOOTHING);
-
-  // ---------------- ACCELERATION CURVE ----------------
-  float speedX = smoothGZ * BASE_SPEED;
-  float speedY = smoothGY * BASE_SPEED;
-
-  speedX *= (1.0f + fabs(speedX) * ACCEL_MULT);
-  speedY *= (1.0f + fabs(speedY) * ACCEL_MULT);
-
-  // ---------------- AXIS MAPPING ----------------
-  int moveX = (int)round(-speedX);  // pitch → horizontal (fixed)
-  int moveY = (int)round(speedY);  // roll → vertical (fixed)
-
-  // ---------------- MOVE ----------------
-  if (moveX != 0 || moveY != 0) {
-    bleMouse.move(moveX, moveY);
-  }
-}
-
-// ---------------- BLE JIGGLE ----------------
-
-void jiggle() {
-  if (!bleMouse.isConnected()) return;
-  if (gyroMouseEnabled) return;
-
-  int x = random(2) ? 2 : -2;
-  int y = random(2) ? 2 : -2;
-
-  bleMouse.move(x, y);
-  delay(5);
-  bleMouse.move(-x, -y);
-
-  Serial.println("Mouse jiggled");
-  printRTCNow();
-}
-
-void loadJiggleSetting() {
-  prefs.begin("settings", true);
-  jiggleEnabled = prefs.getBool("jiggle", true); // default ON
-  prefs.end();
-
-  Serial.printf("Jiggle loaded: %s\n", jiggleEnabled ? "ON" : "OFF");
-}
-
-void saveJiggleSetting() {
-  prefs.begin("settings", false);
-  prefs.putBool("jiggle", jiggleEnabled);
-  prefs.end();
-
-  Serial.printf("Jiggle saved: %s\n", jiggleEnabled ? "ON" : "OFF");
-}
-
-void handleJiggleState() {
-  String msg = "Jiggle: ";
-  msg += jiggleEnabled ? "ON" : "OFF";
-  server.send(200, "text/plain", msg);
-}
-
-void handleToggleJiggle() {
-  jiggleEnabled = !jiggleEnabled;
-  saveJiggleSetting();
-
-  if (jiggleEnabled) {
-    vibratePattern(2, 120, 100); // ON feedback
-    server.send(200, "text/plain", "Jiggle enabled");
-  } else {
-    vibratePattern(1, 300, 0); // OFF feedback
-    server.send(200, "text/plain", "Jiggle disabled");
-  }
-}
 // ---------------- OTA / TIME / GYRO / GPIO HANDLERS ----------------
 
 void handleRoot() {
@@ -942,8 +1069,10 @@ void setupWebServer() {
   server.on("/togglegyro", HTTP_POST, handleToggleGyro);
   server.on("/recalibrate", HTTP_POST, handleRecalibrate);
   server.on("/gpiostate", HTTP_GET, handleGPIOState);
-  server.on("/jigglestate", HTTP_GET, handleJiggleState);
-  server.on("/togglejiggle", HTTP_POST, handleToggleJiggle);
+  server.on("/schedule", HTTP_GET, handleGetSchedule);
+  server.on("/schedule", HTTP_POST, handleSetSchedule);
+  server.on("/jiggle", HTTP_GET, handleGetJiggle);
+  server.on("/jiggle", HTTP_POST, handleSetJiggle);
 
   server.begin();
 }
@@ -1024,8 +1153,588 @@ void manageHotspotByOrientation() {
   }
 }
 
+bool parseTimeOnly(String t, int &hour, int &minute) {
+  if (t.length() < 5) return false;
+  if (t.charAt(2) != ':') return false;
+
+  hour = t.substring(0, 2).toInt();
+  minute = t.substring(3, 5).toInt();
+
+  if (hour < 0 || hour > 23) return false;
+  if (minute < 0 || minute > 59) return false;
+
+  return true;
+}
+
+String getScheduledTaskSummary() {
+  if (!scheduledTask.enabled) {
+    return "No schedule set | Text: " + scheduledTaskText;
+  }
+
+  if (!scheduledTask.repeat) {
+    char buf[120];
+    snprintf(buf, sizeof(buf),
+      "Mode: once | %04d-%02d-%02d %02d:%02d | Text: ",
+      scheduledTask.year, scheduledTask.month, scheduledTask.day,
+      scheduledTask.hour, scheduledTask.minute
+    );
+    return String(buf) + scheduledTaskText;
+  }
+
+  String days = "";
+  const char* dayNames[7] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+  for (int i = 0; i < 7; i++) {
+    if (scheduledTask.daysMask & (1 << i)) {
+      if (days.length() > 0) days += ", ";
+      days += dayNames[i];
+    }
+  }
+
+  char buf[120];
+  snprintf(buf, sizeof(buf),
+    "Mode: repeat | %02d:%02d | Days: ",
+    scheduledTask.hour, scheduledTask.minute
+  );
+
+  return String(buf) + days + " | Text: " + scheduledTaskText;
+}
 
 
+void loadScheduleFromFlash() {
+  prefs.begin("schedule", true);
+
+  scheduledTask.enabled    = prefs.getBool("enabled", false);
+  scheduledTask.repeat     = prefs.getBool("repeat", false);
+  scheduledTask.year       = prefs.getInt("year", 0);
+  scheduledTask.month      = prefs.getInt("month", 0);
+  scheduledTask.day        = prefs.getInt("day", 0);
+  scheduledTask.hour       = prefs.getInt("hour", 0);
+  scheduledTask.minute     = prefs.getInt("minute", 0);
+  scheduledTask.daysMask   = prefs.getUChar("daysMask", 0);
+  scheduledTask.lastRunKey = prefs.getUInt("lastRunKey", 0);
+  scheduledTaskText        = prefs.getString("text", "Hello world!");
+
+  prefs.end();
+
+  Serial.println("Schedule loaded from flash");
+  Serial.println(getScheduledTaskSummary());
+  Serial.print("Scheduled text: ");
+  Serial.println(scheduledTaskText);
+}
+
+void tapKey(uint8_t key) {
+  keyboard->keyPress(key);
+  keyboard->sendKeyReport();
+  delay(30);
+
+  keyboard->keyRelease(key);
+  keyboard->sendKeyReport();
+  delay(40);
+}
+
+void tapModifiedKey(uint8_t mod, uint8_t key) {
+  keyboard->modifierKeyPress(mod);
+  keyboard->sendKeyReport();
+  delay(15);
+
+  keyboard->keyPress(key);
+  keyboard->sendKeyReport();
+  delay(30);
+
+  keyboard->keyRelease(key);
+  keyboard->sendKeyReport();
+  delay(15);
+
+  keyboard->modifierKeyRelease(mod);
+  keyboard->sendKeyReport();
+  delay(40);
+}
+
+bool sendMapped(uint8_t key, uint8_t mod) {
+  if (mod) tapModifiedKey(mod, key);
+  else tapKey(key);
+  return true;
+}
+
+bool mapCharDE(char c, uint8_t &key, uint8_t &mod) {
+  mod = 0;
+
+  if (c >= 'a' && c <= 'z') {
+    key = KEY_A + (c - 'a');
+    if (c == 'y') key = KEY_Z;
+    else if (c == 'z') key = KEY_Y;
+    return true;
+  }
+
+  if (c >= 'A' && c <= 'Z') {
+    mod = KEY_MOD_LSHIFT;
+    char lower = c - 'A' + 'a';
+    key = KEY_A + (lower - 'a');
+    if (c == 'Y') key = KEY_Z;
+    else if (c == 'Z') key = KEY_Y;
+    return true;
+  }
+
+  if (c >= '1' && c <= '9') { key = KEY_1 + (c - '1'); return true; }
+  if (c == '0') { key = KEY_0; return true; }
+
+  switch (c) {
+    case ' ': key = KEY_SPACE; return true;
+    case ',': key = KEY_COMMA; return true;
+    case '.': key = KEY_DOT; return true;
+    case '-': key = KEY_SLASH; return true;     // verify on your host
+    case '+': key = KEY_RIGHTBRACE; return true;
+    case '?': key = KEY_MINUS; mod = KEY_MOD_LSHIFT; return true;
+    case '!': key = KEY_1; mod = KEY_MOD_LSHIFT; return true;
+
+    // 8-bit chars only if your source encoding matches
+    case '\xE4': key = KEY_APOSTROPHE; return true;               // ä
+    case '\xF6': key = KEY_SEMICOLON; return true;                // ö
+    case '\xFC': key = KEY_LEFTBRACE; return true;                // ü
+    case '\xC4': key = KEY_APOSTROPHE; mod = KEY_MOD_LSHIFT; return true; // Ä
+    case '\xD6': key = KEY_SEMICOLON; mod = KEY_MOD_LSHIFT; return true;  // Ö
+    case '\xDC': key = KEY_LEFTBRACE; mod = KEY_MOD_LSHIFT; return true;  // Ü
+    case '\xDF': key = KEY_MINUS; return true;                    // ß
+  }
+
+  return false;
+}
+
+bool mapCharHU(char c, uint8_t &key, uint8_t &mod) {
+  mod = 0;
+
+  if (c >= 'a' && c <= 'z') {
+    key = KEY_A + (c - 'a');
+    if (c == 'y') key = KEY_Z;
+    else if (c == 'z') key = KEY_Y;
+    return true;
+  }
+
+  if (c >= 'A' && c <= 'Z') {
+    mod = KEY_MOD_LSHIFT;
+    char lower = c - 'A' + 'a';
+    key = KEY_A + (lower - 'a');
+    if (c == 'Y') key = KEY_Z;
+    else if (c == 'Z') key = KEY_Y;
+    return true;
+  }
+
+  if (c >= '1' && c <= '9') { key = KEY_1 + (c - '1'); return true; }
+  if (c == '0') { key = KEY_0; return true; }
+
+  switch (c) {
+    case ' ': key = KEY_SPACE; return true;
+    case ',': key = KEY_COMMA; return true;
+    case '.': key = KEY_DOT; return true;
+    case '!': key = KEY_1; mod = KEY_MOD_LSHIFT; return true;
+
+    // these are placeholders you must verify on your OS/layout
+    // Hungarian special letters are not portable across hosts
+    default: return false;
+  }
+}
+
+bool mapChar(char c, KeyboardLayout layout, uint8_t &key, uint8_t &mod) {
+  switch (layout) {
+    case LAYOUT_DE: return mapCharDE(c, key, mod);
+    case LAYOUT_HU: return mapCharHU(c, key, mod);
+    case LAYOUT_US:
+    default:
+      return false;
+  }
+}
+
+void typeText(const char* text) {
+  for (int i = 0; text[i] != '\0'; i++) {
+    uint8_t key = 0, mod = 0;
+    if (mapChar(text[i], activeLayout, key, mod)) {
+      sendMapped(key, mod);
+    }
+  }
+}
+
+
+void leftClick() {
+  mouse->mousePress(1);
+  mouse->sendMouseReport();
+  delay(60);
+
+  mouse->mouseRelease(1);
+  mouse->sendMouseReport();
+  delay(150);
+}
+
+void setupBLEHID() {
+  KeyboardConfiguration keyboardConfig;
+  keyboardConfig.setAutoReport(false);
+  keyboard = new KeyboardDevice(keyboardConfig);
+
+  MouseConfiguration mouseConfig;
+  mouseConfig.setAutoReport(false);
+  mouse = new MouseDevice(mouseConfig);
+
+  compositeHID.addDevice(keyboard);
+  compositeHID.addDevice(mouse);
+  compositeHID.begin();
+
+  Serial.println("BLE HID started");
+}
+
+void runScheduledTask() {
+  if (!compositeHID.isConnected()) {
+    Serial.println("Scheduled task skipped: BLE HID not connected");
+    return;
+  }
+  mouse->mouseMove(10, 0);
+  mouse->sendMouseReport();
+  delay(200);
+
+  leftClick();
+  delay(200);
+  leftClick();
+  delay(200);
+  typeText(scheduledTaskText.c_str());
+  tapKey(KEY_ENTER);
+}
+
+void handleGetSchedule() {
+  String json = "{";
+  json += "\"enabled\":" + String(scheduledTask.enabled ? "true" : "false") + ",";
+  json += "\"mode\":\"";
+  json += scheduledTask.repeat ? "repeat" : "once";
+  json += "\",";
+
+  char dt[20];
+  snprintf(dt, sizeof(dt), "%04d-%02d-%02dT%02d:%02d",
+           scheduledTask.year, scheduledTask.month, scheduledTask.day,
+           scheduledTask.hour, scheduledTask.minute);
+
+  char tm[6];
+  snprintf(tm, sizeof(tm), "%02d:%02d", scheduledTask.hour, scheduledTask.minute);
+
+  String safeText = scheduledTaskText;
+  safeText.replace("\\", "\\\\");
+  safeText.replace("\"", "\\\"");
+  safeText.replace("\n", "\\n");
+  safeText.replace("\r", "");
+
+  json += "\"datetime\":\"" + String(dt) + "\",";
+  json += "\"time\":\"" + String(tm) + "\",";
+  json += "\"text\":\"" + safeText + "\",";
+  json += "\"days\":[";
+
+  bool first = true;
+  for (int i = 0; i < 7; i++) {
+    if (scheduledTask.daysMask & (1 << i)) {
+      if (!first) json += ",";
+      json += String(i);
+      first = false;
+    }
+  }
+
+  json += "],";
+  json += "\"summary\":\"" + getScheduledTaskSummary() + "\"";
+  json += "}";
+
+  server.send(200, "application/json", json);
+}
+
+String extractJsonString(String body, const String& key) {
+  String pattern = "\"" + key + "\":\"";
+  int start = body.indexOf(pattern);
+  if (start < 0) return "";
+
+  start += pattern.length();
+  int end = start;
+  bool escape = false;
+
+  while (end < body.length()) {
+    char c = body.charAt(end);
+
+    if (c == '\\' && !escape) {
+      escape = true;
+      end++;
+      continue;
+    }
+
+    if (c == '"' && !escape) {
+      break;
+    }
+
+    escape = false;
+    end++;
+  }
+
+  String value = body.substring(start, end);
+  value.replace("\\n", "\n");
+  value.replace("\\\"", "\"");
+  value.replace("\\\\", "\\");
+  return value;
+}
+
+void handleSetSchedule() {
+  if (!rtcAvailable) {
+    server.send(500, "text/plain", "RTC not available");
+    return;
+  }
+
+  String body = server.arg("plain");
+  if (body.length() == 0) {
+    server.send(400, "text/plain", "Missing JSON body");
+    return;
+  }
+
+  String textValue = extractJsonString(body, "text");
+  if (textValue.length() == 0) {
+    textValue = "Hello world!";
+  }
+
+
+  if (body.indexOf("\"mode\":\"once\"") >= 0) {
+    int idx = body.indexOf("\"datetime\":\"");
+    if (idx < 0) {
+      server.send(400, "text/plain", "Missing datetime");
+      return;
+    }
+
+    idx += 12;
+    int end = body.indexOf("\"", idx);
+    String dt = body.substring(idx, end);
+
+    int year, month, day, hour, minute;
+    if (!parseDateTimeLocal(dt, year, month, day, hour, minute)) {
+      server.send(400, "text/plain", "Invalid datetime format");
+      return;
+    }
+
+    scheduledTask.enabled = true;
+    scheduledTask.repeat = false;
+    scheduledTask.year = year;
+    scheduledTask.month = month;
+    scheduledTask.day = day;
+    scheduledTask.hour = hour;
+    scheduledTask.minute = minute;
+    scheduledTask.daysMask = 0;
+    scheduledTask.lastRunKey = 0;
+    scheduledTaskText = textValue;
+
+    saveScheduleToFlash();
+    server.send(200, "text/plain", "One-time schedule saved");
+    Serial.println(getScheduledTaskSummary());
+    return;
+  }
+
+  if (body.indexOf("\"mode\":\"repeat\"") >= 0) {
+    int idxTime = body.indexOf("\"time\":\"");
+    if (idxTime < 0) {
+      server.send(400, "text/plain", "Missing time");
+      return;
+    }
+
+    idxTime += 8;
+    int endTime = body.indexOf("\"", idxTime);
+    String t = body.substring(idxTime, endTime);
+
+    int hour, minute;
+    if (!parseTimeOnly(t, hour, minute)) {
+      server.send(400, "text/plain", "Invalid time format");
+      return;
+    }
+
+    int idxDays = body.indexOf("\"days\":[");
+    if (idxDays < 0) {
+      server.send(400, "text/plain", "Missing days");
+      return;
+    }
+
+    idxDays += 8;
+    int endDays = body.indexOf("]", idxDays);
+    String dayPart = body.substring(idxDays, endDays);
+
+    uint8_t mask = 0;
+    int start = 0;
+    while (start < dayPart.length()) {
+      int comma = dayPart.indexOf(",", start);
+      String token;
+      if (comma == -1) {
+        token = dayPart.substring(start);
+        start = dayPart.length();
+      } else {
+        token = dayPart.substring(start, comma);
+        start = comma + 1;
+      }
+
+      if (token.length() > 0) {
+        int d = token.toInt();
+        if (d >= 0 && d <= 6) {
+          mask |= (1 << d);
+        }
+      }
+    }
+
+    if (mask == 0) {
+      server.send(400, "text/plain", "No weekdays selected");
+      return;
+    }
+
+    scheduledTask.enabled = true;
+    scheduledTask.repeat = true;
+    scheduledTask.year = 0;
+    scheduledTask.month = 0;
+    scheduledTask.day = 0;
+    scheduledTask.hour = hour;
+    scheduledTask.minute = minute;
+    scheduledTask.daysMask = mask;
+    scheduledTask.lastRunKey = 0;
+    scheduledTaskText = textValue;
+
+    saveScheduleToFlash();
+    server.send(200, "text/plain", "Repeat schedule saved");
+    Serial.println(getScheduledTaskSummary());
+    return;
+  }
+
+  server.send(400, "text/plain", "Invalid mode");
+}
+
+uint32_t makeDateKey(const DateTime& now) {
+  return (uint32_t)now.year() * 10000UL + (uint32_t)now.month() * 100UL + (uint32_t)now.day();
+}
+
+void handleScheduledTaskRun() {
+  if (!rtcAvailable || !scheduledTask.enabled) return;
+
+  DateTime now = rtc.now();
+  uint32_t todayKey = makeDateKey(now);
+
+  if (!scheduledTask.repeat) {
+    if (now.year() == scheduledTask.year &&
+        now.month() == scheduledTask.month &&
+        now.day() == scheduledTask.day &&
+        now.hour() == scheduledTask.hour &&
+        now.minute() == scheduledTask.minute) {
+
+      if (scheduledTask.lastRunKey != todayKey) {
+        scheduledTask.lastRunKey = todayKey;
+        saveScheduleToFlash();
+
+        runScheduledTask();
+
+        scheduledTask.enabled = false;
+        saveScheduleToFlash();
+        Serial.println("One-time schedule executed and disabled");
+      }
+    }
+  } else {
+    int dow = now.dayOfTheWeek(); // 0=Sunday ... 6=Saturday
+
+    bool dayMatch = (scheduledTask.daysMask & (1 << dow)) != 0;
+    bool timeMatch = (now.hour() == scheduledTask.hour && now.minute() == scheduledTask.minute);
+
+    if (dayMatch && timeMatch) {
+      if (scheduledTask.lastRunKey != todayKey) {
+        scheduledTask.lastRunKey = todayKey;
+        saveScheduleToFlash();
+
+        runScheduledTask();
+      }
+    }
+  }
+}
+
+void saveScheduleToFlash() {
+  prefs.begin("schedule", false);
+
+  prefs.putBool("enabled", scheduledTask.enabled);
+  prefs.putBool("repeat", scheduledTask.repeat);
+  prefs.putInt("year", scheduledTask.year);
+  prefs.putInt("month", scheduledTask.month);
+  prefs.putInt("day", scheduledTask.day);
+  prefs.putInt("hour", scheduledTask.hour);
+  prefs.putInt("minute", scheduledTask.minute);
+  prefs.putUChar("daysMask", scheduledTask.daysMask);
+  prefs.putUInt("lastRunKey", scheduledTask.lastRunKey);
+  prefs.putString("text", scheduledTaskText);
+
+  prefs.end();
+
+  Serial.println("Schedule saved to flash");
+}
+
+void saveJiggleToFlash() {
+  prefs.begin("jiggle", false);
+  prefs.putBool("enabled", jiggleEnabled);
+  prefs.end();
+
+  Serial.print("Jiggle saved: ");
+  Serial.println(jiggleEnabled ? "ON" : "OFF");
+}
+
+void loadJiggleFromFlash() {
+  prefs.begin("jiggle", true);
+  jiggleEnabled = prefs.getBool("enabled", true); // default ON
+  prefs.end();
+
+  Serial.print("Jiggle loaded: ");
+  Serial.println(jiggleEnabled ? "ON" : "OFF");
+}
+
+void jiggle() {
+  if (!compositeHID.isConnected()) return;
+  if (!jiggleEnabled) return;
+  if (gyroMouseEnabled) return;
+
+  int x = random(2) ? 2 : -2;
+  int y = random(2) ? 2 : -2;
+
+  mouse->mouseMove(x, y);
+  mouse->sendMouseReport();
+  delay(5);
+
+  mouse->mouseMove(-x, -y);
+  mouse->sendMouseReport();
+
+  Serial.println("Mouse jiggled");
+  printRTCNow();
+}
+
+void handleMouseJiggle() {
+  if (!jiggleEnabled) return;
+  if (!compositeHID.isConnected()) return;
+  if (gyroMouseEnabled) return;
+
+  unsigned long now = millis();
+  if (now - lastJiggle >= jiggleInterval) {
+    lastJiggle = now;
+    jiggle();
+  }
+}
+
+void handleGetJiggle() {
+  String json = "{";
+  json += "\"enabled\":";
+  json += jiggleEnabled ? "true" : "false";
+  json += "}";
+
+  server.send(200, "application/json", json);
+}
+
+void handleSetJiggle() {
+  if (!server.hasArg("enabled")) {
+    server.send(400, "text/plain", "Missing enabled field");
+    return;
+  }
+
+  String value = server.arg("enabled");
+  jiggleEnabled = (value == "1" || value == "true" || value == "on");
+
+  saveJiggleToFlash();
+
+  Serial.print("Mouse jiggle set to: ");
+  Serial.println(jiggleEnabled ? "ON" : "OFF");
+
+  server.send(200, "text/plain", String("Mouse jiggle ") + (jiggleEnabled ? "enabled" : "disabled"));
+}
 // ---------------- SETUP ----------------
 
 void setup() {
@@ -1052,6 +1761,9 @@ void setup() {
   Wire.begin(SDA_PIN, SCL_PIN);
 
   setupRTC();
+  setupBLEHID();
+  loadScheduleFromFlash();
+  loadJiggleFromFlash();
 
   mpuAvailable = setupMPU();
   if (mpuAvailable) {
@@ -1066,49 +1778,16 @@ void setup() {
     printMPUCorrected();
   }
 
-  loadJiggleSetting();
-
-  BLESecurity *pSecurity = new BLESecurity();
-  pSecurity->setAuthenticationMode(ESP_LE_AUTH_BOND);
-  pSecurity->setCapability(ESP_IO_CAP_NONE);
-  pSecurity->setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
-
-  bleMouse.begin();
-  bleMouse.setBatteryLevel(95);
 }
 
 // ---------------- LOOP ----------------
 
 void loop() {
   manageHotspotByOrientation();
-
+  handleScheduledTaskRun();
+  handleMouseJiggle();
   bool hotspotClient = apStarted && (WiFi.softAPgetStationNum() > 0);
 
-  if (!bleMouse.isConnected() && !hotspotClient) {
-    if (millis() - disconnectStart >= sleepTimeout) {
-      Serial.println("Entering deep sleep");
-      printRTCNow();
-
-      esp_sleep_enable_timer_wakeup(60ULL * 1000000ULL);
-      esp_deep_sleep_start();
-    }
-
-    delay(20);
-    return;
-  }
-
-  if (bleMouse.isConnected()) {
-    disconnectStart = millis();
-  }
-
-  handleGyroMouse();
-
-  unsigned long now = millis();
-
-  if (jiggleEnabled && !gyroMouseEnabled && bleMouse.isConnected() && (now - lastJiggle >= jiggleInterval)) {
-    jiggle();
-    lastJiggle = now;
-  }
 
   delay(5);
 }
