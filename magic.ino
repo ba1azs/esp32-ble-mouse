@@ -1386,11 +1386,12 @@ void runScheduledTask() {
     Serial.println("Scheduled task skipped: BLE HID not connected");
     return;
   }
+  delay(2000);
 
   tapKey(KEY_ENTER);
   mouse->mouseMove(10, 0);
   mouse->sendMouseReport();
-  delay(200);
+  delay(1000);
 
   leftClick();
   typeText(scheduledTaskText.c_str());
