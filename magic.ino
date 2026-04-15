@@ -11,6 +11,7 @@
 #include <Adafruit_Sensor.h>
 #include <Preferences.h>
 #include <math.h>
+#include "esp_bt.h"
 
 enum KeyboardLayout {
   LAYOUT_US,
@@ -25,13 +26,13 @@ WebServer server(80);
 RTC_DS3231 rtc;
 Adafruit_MPU6050 mpu;
 Preferences prefs;
-KeyboardDevice* keyboard;
-MouseDevice* mouse;
+KeyboardDevice* keyboard = nullptr;
+MouseDevice* mouse = nullptr;
 BleCompositeHID compositeHID("CompositeHID Keyboard and Mouse", "Mystfit", 100);
 // ---------------- SETTINGS ----------------
 
 const unsigned long hotspotStopDelay = 30000;
-const unsigned long jiggleInterval = 60000; // 60 seconds
+unsigned long jiggleInterval = 60000; // 60 seconds, configurable
 
 const char* apSSID = "Magic Mouse";
 const char* apPassword = "";
@@ -67,7 +68,6 @@ const float HEAD_DOWN_Z_THRESHOLD = -7.0f;
 // ---------------- STATE ----------------
 
 unsigned long lastJiggle = 0;
-unsigned long disconnectStart = 0;
 unsigned long lastGyroMove = 0;
 unsigned long normalOrientationSince = 0;
 
@@ -106,6 +106,9 @@ struct ScheduledTaskConfig {
   // prevents multiple runs in same minute/day
   uint32_t lastRunKey = 0;
 };
+
+bool bluetoothEnabled = true; // default ON
+int jigglePixels = 2;         // default jump distance
 
 ScheduledTaskConfig scheduledTask;
 String scheduledTaskText = "Hello world!";
@@ -195,6 +198,27 @@ button{
 <progress id="bar" value="0" max="100"></progress>
 <div id="status"></div>
 
+
+<div class="section">
+  <h2>Bluetooth</h2>
+  <div class="small">Turn the BLE keyboard/mouse feature ON or OFF.</div>
+
+  <div style="margin-top:12px;">
+    <label for="bluetoothEnabledSelect"><b>Bluetooth</b></label>
+    <select id="bluetoothEnabledSelect" style="width:100%;padding:8px;margin-top:6px;">
+      <option value="on">ON</option>
+      <option value="off">OFF</option>
+    </select>
+  </div>
+
+  <button onclick="saveBluetooth()">Save Bluetooth</button>
+  <button onclick="loadBluetooth()">Refresh Bluetooth</button>
+
+  <div id="bluetoothStatus"></div>
+  <div class="state" id="bluetoothNow">Loading Bluetooth state...</div>
+</div>
+
+
 <div class="section">
   <h2>Set RTC Time</h2>
   <div class="state" id="rtcNow">Loading RTC time...</div>
@@ -261,12 +285,24 @@ button{
       <option value="off">OFF</option>
     </select>
   </div>
+    <div style="margin-top:12px;">
+  <label for="jigglePixels"><b>Jump pixels</b></label>
+  <input type="number" id="jigglePixels" min="1" max="50" value="2">
+  <div class="small">How many pixels the mouse jumps each jiggle.</div>
+  </div>
+<div style="margin-top:12px;">
+  <label for="jiggleInterval"><b>Jiggle interval (ms)</b></label>
+  <input type="number" id="jiggleInterval" min="1000" max="3600000" value="60000">
+  <div class="small">How often the mouse jiggles. 60000 = 60 seconds.</div>
+</div>
 
   <button onclick="saveJiggle()">Save Mouse Jiggle</button>
   <button onclick="loadJiggle()">Refresh Mouse Jiggle</button>
 
   <div id="jiggleStatus"></div>
   <div class="state" id="jiggleNow">Loading jiggle state...</div>
+
+
 </div>
 
 <div class="section">
@@ -305,6 +341,42 @@ function upload(){
   xhr.send(formData);
 
   document.getElementById("status").innerHTML="Uploading...";
+}
+
+function saveBluetooth(){
+  let enabled = document.getElementById("bluetoothEnabledSelect").value === "on";
+
+  let xhr = new XMLHttpRequest();
+  xhr.onreadystatechange = function(){
+    if(xhr.readyState === 4){
+      document.getElementById("bluetoothStatus").innerHTML = xhr.responseText;
+      loadBluetooth();
+    }
+  };
+
+  xhr.open("POST", "/bluetooth", true);
+  xhr.setRequestHeader("Content-Type", "application/x-www-form-urlencoded");
+  xhr.send("enabled=" + (enabled ? "1" : "0"));
+
+  document.getElementById("bluetoothStatus").innerHTML = "Saving Bluetooth setting...";
+}
+
+function loadBluetooth(){
+  let xhr = new XMLHttpRequest();
+  xhr.onreadystatechange = function(){
+    if(xhr.readyState === 4){
+      if(xhr.status === 200){
+        let data = JSON.parse(xhr.responseText);
+        document.getElementById("bluetoothEnabledSelect").value = data.enabled ? "on" : "off";
+        document.getElementById("bluetoothNow").innerHTML = "Bluetooth: " + (data.enabled ? "ON" : "OFF");
+      } else {
+        document.getElementById("bluetoothNow").innerHTML = "Failed to load Bluetooth state";
+      }
+    }
+  };
+
+  xhr.open("GET", "/bluetooth", true);
+  xhr.send();
 }
 
 function setTime(){
@@ -361,64 +433,6 @@ function toggleScheduleMode(){
   document.getElementById("repeatBox").style.display = (mode === "repeat") ? "block" : "none";
 }
 
-function saveSchedule(){
-  let mode = document.getElementById("scheduleMode").value;
-  let taskText = document.getElementById("taskText").value;
-
-  if(!taskText){
-    taskText = "Hello world!";
-  }
-
-  let payload = {
-    mode: mode,
-    text: taskText
-  };
-
-  if(mode === "once"){
-    let dt = document.getElementById("scheduleDateTime").value;
-    if(!dt){
-      alert("Select date and time first");
-      return;
-    }
-    payload.datetime = dt;
-  } else {
-    let t = document.getElementById("repeatTime").value;
-    if(!t){
-      alert("Select repeat time first");
-      return;
-    }
-    payload.time = t;
-
-    let days = [];
-    let boxes = document.querySelectorAll(".weekday");
-    for(let i = 0; i < boxes.length; i++){
-      if(boxes[i].checked){
-        days.push(parseInt(boxes[i].value));
-      }
-    }
-
-    if(days.length === 0){
-      alert("Select at least one weekday");
-      return;
-    }
-
-    payload.days = days;
-  }
-
-  let xhr = new XMLHttpRequest();
-  xhr.onreadystatechange = function(){
-    if(xhr.readyState === 4){
-      document.getElementById("scheduleStatus").innerHTML = xhr.responseText;
-      loadSchedule();
-    }
-  };
-
-  xhr.open("POST", "/schedule", true);
-  xhr.setRequestHeader("Content-Type", "application/json");
-  xhr.send(JSON.stringify(payload));
-
-  document.getElementById("scheduleStatus").innerHTML = "Saving schedule...";
-}
 
 function loadSchedule(){
   let xhr = new XMLHttpRequest();
@@ -547,6 +561,14 @@ function saveSchedule(){
 
 function saveJiggle(){
   let enabled = document.getElementById("jiggleEnabledSelect").value === "on";
+  let pixels = parseInt(document.getElementById("jigglePixels").value, 10);
+  let interval = parseInt(document.getElementById("jiggleInterval").value, 10);
+
+  if(isNaN(pixels) || pixels < 1) pixels = 1;
+  if(pixels > 50) pixels = 50;
+
+  if(isNaN(interval) || interval < 1000) interval = 1000;
+  if(interval > 3600000) interval = 3600000;
 
   let xhr = new XMLHttpRequest();
   xhr.onreadystatechange = function(){
@@ -558,7 +580,11 @@ function saveJiggle(){
 
   xhr.open("POST", "/jiggle", true);
   xhr.setRequestHeader("Content-Type", "application/x-www-form-urlencoded");
-  xhr.send("enabled=" + (enabled ? "1" : "0"));
+  xhr.send(
+    "enabled=" + (enabled ? "1" : "0") +
+    "&pixels=" + encodeURIComponent(pixels) +
+    "&interval=" + encodeURIComponent(interval)
+  );
 
   document.getElementById("jiggleStatus").innerHTML = "Saving jiggle setting...";
 }
@@ -571,7 +597,13 @@ function loadJiggle(){
         let data = JSON.parse(xhr.responseText);
 
         document.getElementById("jiggleEnabledSelect").value = data.enabled ? "on" : "off";
-        document.getElementById("jiggleNow").innerHTML = "Mouse jiggle: " + (data.enabled ? "ON" : "OFF");
+        document.getElementById("jigglePixels").value = data.pixels || 2;
+        document.getElementById("jiggleInterval").value = data.interval || 60000;
+
+        document.getElementById("jiggleNow").innerHTML =
+          "Mouse jiggle: " + (data.enabled ? "ON" : "OFF") +
+          " | pixels: " + (data.pixels || 2) +
+          " | interval: " + (data.interval || 60000) + " ms";
       } else {
         document.getElementById("jiggleNow").innerHTML = "Failed to load jiggle state";
       }
@@ -587,6 +619,7 @@ window.onload = function(){
   refreshGPIO();
   loadSchedule();
   loadJiggle();
+  loadBluetooth();
   toggleScheduleMode();
 };
 </script>
@@ -627,50 +660,63 @@ void vibrateHotspotOff() {
   vibratePattern(3, 300, 200);
 }
 
+
+
+void saveBluetoothToFlash() {
+  prefs.begin("ble", false);
+  prefs.putBool("enabled", bluetoothEnabled);
+  prefs.end();
+
+  Serial.print("Bluetooth saved: ");
+  Serial.println(bluetoothEnabled ? "ON" : "OFF");
+}
+
+void loadBluetoothFromFlash() {
+  prefs.begin("ble", true);
+  bluetoothEnabled = prefs.getBool("enabled", true); // default ON
+  prefs.end();
+
+  Serial.print("Bluetooth loaded: ");
+  Serial.println(bluetoothEnabled ? "ON" : "OFF");
+}
+
+void saveJiggleSettingsToFlash() {
+  prefs.begin("jiggle", false);
+  prefs.putBool("enabled", jiggleEnabled);
+  prefs.putInt("pixels", jigglePixels);
+  prefs.putULong("interval", jiggleInterval);
+  prefs.end();
+
+  Serial.print("Jiggle saved: ");
+  Serial.print(jiggleEnabled ? "ON" : "OFF");
+  Serial.print(" | pixels: ");
+  Serial.print(jigglePixels);
+  Serial.print(" | interval ms: ");
+  Serial.println(jiggleInterval);
+}
+
+void loadJiggleSettingsFromFlash() {
+  prefs.begin("jiggle", true);
+  jiggleEnabled = prefs.getBool("enabled", true);
+  jigglePixels = prefs.getInt("pixels", 2);
+  jiggleInterval = prefs.getULong("interval", 60000);
+  prefs.end();
+
+  if (jigglePixels < 1) jigglePixels = 1;
+  if (jigglePixels > 50) jigglePixels = 50;
+
+  if (jiggleInterval < 1000) jiggleInterval = 1000;
+  if (jiggleInterval > 3600000UL) jiggleInterval = 3600000UL;
+
+  Serial.print("Jiggle loaded: ");
+  Serial.print(jiggleEnabled ? "ON" : "OFF");
+  Serial.print(" | pixels: ");
+  Serial.print(jigglePixels);
+  Serial.print(" | interval ms: ");
+  Serial.println(jiggleInterval);
+}
 // ---------------- PERSISTENCE ----------------
 
-void saveCalibrationToFlash() {
-  prefs.begin("mpu", false);
-
-  prefs.putBool("valid", true);
-  prefs.putFloat("aox", accelOffsetX);
-  prefs.putFloat("aoy", accelOffsetY);
-  prefs.putFloat("aoz", accelOffsetZ);
-  prefs.putFloat("gox", gyroOffsetX);
-  prefs.putFloat("goy", gyroOffsetY);
-  prefs.putFloat("goz", gyroOffsetZ);
-
-  prefs.end();
-
-  Serial.println("Calibration saved to flash");
-}
-
-bool loadCalibrationFromFlash() {
-  prefs.begin("mpu", true);
-
-  bool valid = prefs.getBool("valid", false);
-  if (valid) {
-    accelOffsetX = prefs.getFloat("aox", accelOffsetX);
-    accelOffsetY = prefs.getFloat("aoy", accelOffsetY);
-    accelOffsetZ = prefs.getFloat("aoz", accelOffsetZ);
-    gyroOffsetX  = prefs.getFloat("gox", gyroOffsetX);
-    gyroOffsetY  = prefs.getFloat("goy", gyroOffsetY);
-    gyroOffsetZ  = prefs.getFloat("goz", gyroOffsetZ);
-  }
-
-  prefs.end();
-
-  if (valid) {
-    Serial.println("Loaded calibration from flash");
-  } else {
-    Serial.println("No saved calibration found, using default values");
-  }
-
-  Serial.printf("Accel offsets: %.4f %.4f %.4f\n", accelOffsetX, accelOffsetY, accelOffsetZ);
-  Serial.printf("Gyro offsets : %.4f %.4f %.4f\n", gyroOffsetX, gyroOffsetY, gyroOffsetZ);
-
-  return valid;
-}
 
 // ---------------- RTC ----------------
 
@@ -771,102 +817,8 @@ bool setupMPU() {
   return true;
 }
 
-bool waitForMPUStable() {
-  Serial.println("Waiting for MPU to become stable...");
 
-  sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp);
 
-  float lastAx = a.acceleration.x;
-  float lastAy = a.acceleration.y;
-  float lastAz = a.acceleration.z;
-  float lastGx = g.gyro.x;
-  float lastGy = g.gyro.y;
-  float lastGz = g.gyro.z;
-
-  int stableCount = 0;
-  unsigned long start = millis();
-
-  while (millis() - start < 15000) {
-    mpu.getEvent(&a, &g, &temp);
-
-    float da =
-      fabs(a.acceleration.x - lastAx) +
-      fabs(a.acceleration.y - lastAy) +
-      fabs(a.acceleration.z - lastAz);
-
-    float dg =
-      fabs(g.gyro.x - lastGx) +
-      fabs(g.gyro.y - lastGy) +
-      fabs(g.gyro.z - lastGz);
-
-    if (da < STABLE_ACCEL_DELTA && dg < STABLE_GYRO_DELTA) {
-      stableCount++;
-      if (stableCount >= STABLE_SAMPLES) {
-        Serial.println("MPU is stable");
-        return true;
-      }
-    } else {
-      stableCount = 0;
-    }
-
-    lastAx = a.acceleration.x;
-    lastAy = a.acceleration.y;
-    lastAz = a.acceleration.z;
-    lastGx = g.gyro.x;
-    lastGy = g.gyro.y;
-    lastGz = g.gyro.z;
-
-    delay(50);
-  }
-
-  Serial.println("MPU stability timeout, calibrating anyway");
-  return false;
-}
-
-void calibrateMPU() {
-  Serial.println("Calibrating MPU6050... keep device still");
-
-  sensors_event_t a, g, temp;
-  float ax = 0, ay = 0, az = 0;
-  float gx = 0, gy = 0, gz = 0;
-
-  for (int i = 0; i < CAL_SAMPLES; i++) {
-    mpu.getEvent(&a, &g, &temp);
-
-    ax += a.acceleration.x;
-    ay += a.acceleration.y;
-    az += a.acceleration.z;
-
-    gx += g.gyro.x;
-    gy += g.gyro.y;
-    gz += g.gyro.z;
-
-    delay(10);
-  }
-
-  accelOffsetX = ax / CAL_SAMPLES;
-  accelOffsetY = ay / CAL_SAMPLES;
-  accelOffsetZ = (az / CAL_SAMPLES) - 9.80665f;
-
-  gyroOffsetX = gx / CAL_SAMPLES;
-  gyroOffsetY = gy / CAL_SAMPLES;
-  gyroOffsetZ = gz / CAL_SAMPLES;
-
-  Serial.println("MPU calibration done");
-  Serial.printf("Accel offsets: %.4f %.4f %.4f\n", accelOffsetX, accelOffsetY, accelOffsetZ);
-  Serial.printf("Gyro offsets : %.4f %.4f %.4f\n", gyroOffsetX, gyroOffsetY, gyroOffsetZ);
-
-  saveCalibrationToFlash();
-  vibrateCalibrationFinished();
-}
-
-void recalibrateAndSaveMPU() {
-  if (!mpuAvailable) return;
-
-  waitForMPUStable();
-  calibrateMPU();
-}
 
 void readCorrectedMPU(float &ax, float &ay, float &az, float &gx, float &gy, float &gz) {
   sensors_event_t a, g, temp;
@@ -975,20 +927,6 @@ void handleToggleGyro() {
   }
 }
 
-void handleRecalibrate() {
-  if (!mpuAvailable) {
-    server.send(500, "text/plain", "MPU6050 not available");
-    return;
-  }
-
-  gyroMouseEnabled = false;
-  Serial.println("Web request: recalibrate gyroscope");
-
-  recalibrateAndSaveMPU();
-  printMPUCorrected();
-
-  server.send(200, "text/plain", "Gyroscope recalibrated and saved to flash");
-}
 
 void handleGPIOState() {
   String json = "[";
@@ -1068,12 +1006,13 @@ void setupWebServer() {
   server.on("/rtctime-local", HTTP_GET, handleRTCNowLocal);
   server.on("/gyrostate", HTTP_GET, handleGyroState);
   server.on("/togglegyro", HTTP_POST, handleToggleGyro);
-  server.on("/recalibrate", HTTP_POST, handleRecalibrate);
   server.on("/gpiostate", HTTP_GET, handleGPIOState);
   server.on("/schedule", HTTP_GET, handleGetSchedule);
   server.on("/schedule", HTTP_POST, handleSetSchedule);
   server.on("/jiggle", HTTP_GET, handleGetJiggle);
   server.on("/jiggle", HTTP_POST, handleSetJiggle);
+  server.on("/bluetooth", HTTP_GET, handleGetBluetooth);
+  server.on("/bluetooth", HTTP_POST, handleSetBluetooth);
 
   server.begin();
 }
@@ -1109,6 +1048,51 @@ void stopHotspot() {
   Serial.println("Hotspot stopped");
   vibrateHotspotOff();
 }
+
+void tapKey(uint8_t key) {
+  if (!bluetoothEnabled || keyboard == nullptr) return;
+
+  keyboard->keyPress(key);
+  keyboard->sendKeyReport();
+  delay(30);
+
+  keyboard->keyRelease(key);
+  keyboard->sendKeyReport();
+  delay(40);
+}
+
+void tapModifiedKey(uint8_t mod, uint8_t key) {
+  if (!bluetoothEnabled || keyboard == nullptr) return;
+
+  keyboard->modifierKeyPress(mod);
+  keyboard->sendKeyReport();
+  delay(15);
+
+  keyboard->keyPress(key);
+  keyboard->sendKeyReport();
+  delay(30);
+
+  keyboard->keyRelease(key);
+  keyboard->sendKeyReport();
+  delay(15);
+
+  keyboard->modifierKeyRelease(mod);
+  keyboard->sendKeyReport();
+  delay(40);
+}
+
+void leftClick() {
+  if (!bluetoothEnabled || mouse == nullptr) return;
+
+  mouse->mousePress(1);
+  mouse->sendMouseReport();
+  delay(60);
+
+  mouse->mouseRelease(1);
+  mouse->sendMouseReport();
+  delay(150);
+}
+
 
 void manageHotspotByOrientation() {
   if (!mpuAvailable) return;
@@ -1223,33 +1207,9 @@ void loadScheduleFromFlash() {
   Serial.println(scheduledTaskText);
 }
 
-void tapKey(uint8_t key) {
-  keyboard->keyPress(key);
-  keyboard->sendKeyReport();
-  delay(30);
 
-  keyboard->keyRelease(key);
-  keyboard->sendKeyReport();
-  delay(40);
-}
 
-void tapModifiedKey(uint8_t mod, uint8_t key) {
-  keyboard->modifierKeyPress(mod);
-  keyboard->sendKeyReport();
-  delay(15);
 
-  keyboard->keyPress(key);
-  keyboard->sendKeyReport();
-  delay(30);
-
-  keyboard->keyRelease(key);
-  keyboard->sendKeyReport();
-  delay(15);
-
-  keyboard->modifierKeyRelease(mod);
-  keyboard->sendKeyReport();
-  delay(40);
-}
 
 bool sendMapped(uint8_t key, uint8_t mod) {
   if (mod) tapModifiedKey(mod, key);
@@ -1355,17 +1315,9 @@ void typeText(const char* text) {
 }
 
 
-void leftClick() {
-  mouse->mousePress(1);
-  mouse->sendMouseReport();
-  delay(60);
+void startBLEHID() {
+  if (keyboard != nullptr || mouse != nullptr) return;
 
-  mouse->mouseRelease(1);
-  mouse->sendMouseReport();
-  delay(150);
-}
-
-void setupBLEHID() {
   KeyboardConfiguration keyboardConfig;
   keyboardConfig.setAutoReport(false);
   keyboard = new KeyboardDevice(keyboardConfig);
@@ -1381,16 +1333,44 @@ void setupBLEHID() {
   Serial.println("BLE HID started");
 }
 
+void stopBLEHID() {
+  if (keyboard != nullptr) {
+    delete keyboard;
+    keyboard = nullptr;
+  }
+
+  if (mouse != nullptr) {
+    delete mouse;
+    mouse = nullptr;
+  }
+
+  compositeHID.end();
+
+  delay(100);
+
+  Serial.println("BLE HID stopped");
+}
+
 void runScheduledTask() {
+  if (!bluetoothEnabled) {
+    Serial.println("Scheduled task skipped: Bluetooth disabled");
+    return;
+  }
+
   if (!compositeHID.isConnected()) {
     Serial.println("Scheduled task skipped: BLE HID not connected");
     return;
   }
+
   delay(2000);
 
   tapKey(KEY_ENTER);
-  mouse->mouseMove(10, 0);
-  mouse->sendMouseReport();
+
+  if (mouse != nullptr) {
+    mouse->mouseMove(10, 0);
+    mouse->sendMouseReport();
+  }
+
   delay(1000);
 
   leftClick();
@@ -1439,6 +1419,43 @@ void handleGetSchedule() {
   json += "}";
 
   server.send(200, "application/json", json);
+}
+
+void handleGetBluetooth() {
+  String json = "{";
+  json += "\"enabled\":";
+  json += bluetoothEnabled ? "true" : "false";
+  json += "}";
+
+  server.send(200, "application/json", json);
+}
+
+void handleSetBluetooth() {
+  if (!server.hasArg("enabled")) {
+    server.send(400, "text/plain", "Missing enabled field");
+    return;
+  }
+
+  bool newState = server.arg("enabled") == "1";
+
+  if (newState == bluetoothEnabled) {
+    server.send(200, "text/plain",
+      String("Bluetooth already ") + (bluetoothEnabled ? "enabled" : "disabled"));
+    return;
+  }
+
+  bluetoothEnabled = newState;
+  saveBluetoothToFlash();
+
+  if (bluetoothEnabled) {
+    Serial.println("Starting BLE (enable)");
+    startBLEHID();
+    server.send(200, "text/plain", "Bluetooth enabled");
+  } else {
+    Serial.println("Stopping BLE (disable)");
+    stopBLEHID();
+    server.send(200, "text/plain", "Bluetooth disabled");
+  }
 }
 
 String extractJsonString(String body, const String& key) {
@@ -1663,31 +1680,15 @@ void saveScheduleToFlash() {
   Serial.println("Schedule saved to flash");
 }
 
-void saveJiggleToFlash() {
-  prefs.begin("jiggle", false);
-  prefs.putBool("enabled", jiggleEnabled);
-  prefs.end();
-
-  Serial.print("Jiggle saved: ");
-  Serial.println(jiggleEnabled ? "ON" : "OFF");
-}
-
-void loadJiggleFromFlash() {
-  prefs.begin("jiggle", true);
-  jiggleEnabled = prefs.getBool("enabled", true); // default ON
-  prefs.end();
-
-  Serial.print("Jiggle loaded: ");
-  Serial.println(jiggleEnabled ? "ON" : "OFF");
-}
 
 void jiggle() {
+  if (!bluetoothEnabled) return;
   if (!compositeHID.isConnected()) return;
   if (!jiggleEnabled) return;
-  if (gyroMouseEnabled) return;
+  if (mouse == nullptr) return;
 
-  int x = random(2) ? 2 : -2;
-  int y = random(2) ? 2 : -2;
+  int x = random(2) ? jigglePixels : -jigglePixels;
+  int y = random(2) ? jigglePixels : -jigglePixels;
 
   mouse->mouseMove(x, y);
   mouse->sendMouseReport();
@@ -1696,7 +1697,8 @@ void jiggle() {
   mouse->mouseMove(-x, -y);
   mouse->sendMouseReport();
 
-  Serial.println("Mouse jiggled");
+  Serial.print("Mouse jiggled | pixels: ");
+  Serial.println(jigglePixels);
   printRTCNow();
 }
 
@@ -1716,6 +1718,12 @@ void handleGetJiggle() {
   String json = "{";
   json += "\"enabled\":";
   json += jiggleEnabled ? "true" : "false";
+  json += ",";
+  json += "\"pixels\":";
+  json += String(jigglePixels);
+  json += ",";
+  json += "\"interval\":";
+  json += String(jiggleInterval);
   json += "}";
 
   server.send(200, "application/json", json);
@@ -1727,15 +1735,42 @@ void handleSetJiggle() {
     return;
   }
 
+  if (!server.hasArg("pixels")) {
+    server.send(400, "text/plain", "Missing pixels field");
+    return;
+  }
+
+  if (!server.hasArg("interval")) {
+    server.send(400, "text/plain", "Missing interval field");
+    return;
+  }
+
   String value = server.arg("enabled");
   jiggleEnabled = (value == "1" || value == "true" || value == "on");
 
-  saveJiggleToFlash();
+  int px = server.arg("pixels").toInt();
+  if (px < 1) px = 1;
+  if (px > 50) px = 50;
+  jigglePixels = px;
+
+  unsigned long interval = strtoul(server.arg("interval").c_str(), nullptr, 10);
+  if (interval < 1000) interval = 1000;
+  if (interval > 3600000UL) interval = 3600000UL;
+  jiggleInterval = interval;
+
+  saveJiggleSettingsToFlash();
 
   Serial.print("Mouse jiggle set to: ");
-  Serial.println(jiggleEnabled ? "ON" : "OFF");
+  Serial.print(jiggleEnabled ? "ON" : "OFF");
+  Serial.print(" | pixels: ");
+  Serial.print(jigglePixels);
+  Serial.print(" | interval ms: ");
+  Serial.println(jiggleInterval);
 
-  server.send(200, "text/plain", String("Mouse jiggle ") + (jiggleEnabled ? "enabled" : "disabled"));
+  server.send(200, "text/plain",
+    String("Mouse jiggle ") + (jiggleEnabled ? "enabled" : "disabled") +
+    " | pixels: " + String(jigglePixels) +
+    " | interval ms: " + String(jiggleInterval));
 }
 // ---------------- SETUP ----------------
 
@@ -1758,27 +1793,22 @@ void setup() {
 
   randomSeed(micros());
 
-  disconnectStart = millis();
-
   Wire.begin(SDA_PIN, SCL_PIN);
 
-  setupRTC();
-  setupBLEHID();
-  loadScheduleFromFlash();
-  loadJiggleFromFlash();
+setupRTC();
+loadBluetoothFromFlash();
+loadScheduleFromFlash();
+loadJiggleSettingsFromFlash();
+
+if (bluetoothEnabled) {
+  startBLEHID();
+} else {
+  keyboard = nullptr;
+  mouse = nullptr;
+  Serial.println("Bluetooth is disabled in settings, BLE HID not started");
+}
 
   mpuAvailable = setupMPU();
-  if (mpuAvailable) {
-    bool loaded = loadCalibrationFromFlash();
-
-    if (!loaded) {
-      Serial.println("Using default calibration values");
-      Serial.printf("Accel offsets: %.4f %.4f %.4f\n", accelOffsetX, accelOffsetY, accelOffsetZ);
-      Serial.printf("Gyro offsets : %.4f %.4f %.4f\n", gyroOffsetX, gyroOffsetY, gyroOffsetZ);
-    }
-
-    printMPUCorrected();
-  }
 
 }
 
@@ -1787,9 +1817,6 @@ void setup() {
 void loop() {
   manageHotspotByOrientation();
   handleScheduledTaskRun();
-  loadJiggleFromFlash();
-  bool hotspotClient = apStarted && (WiFi.softAPgetStationNum() > 0);
-
-
+  handleMouseJiggle();
   delay(5);
 }
